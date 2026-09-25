@@ -1,6 +1,6 @@
-# Early warning of cancer drug tolerance
+# Research proposal: Early warning of cancer drug tolerance
 
-## Idea
+## One-sentence idea
 
 Use a **protein-graph world model** to predict a cancer cell population's response to 24 hours of drug treatment, then ask whether the treated state resembles cells that survive longer treatment. The model also points to proteins that may help explain that response.
 
@@ -42,49 +42,55 @@ Tahoe measures **RNA, not protein abundance or protein activity**. Mapping gene 
 
 **Feasibility boundary:** Tahoe supplies true 24-hour treated and matched vehicle states, but it does **not** supply a measured pre-treatment state or a long-term persister or relapse label for each drug–cell-line condition. Public DTP studies supply later states for selected settings. The first benchmark is therefore **early DTP-like change**; evidence that it predicts later persistence is a separate validation question. A true multi-step treatment planner would need additional longitudinal or combined-intervention data.
 
-## 3. Detailed methodology
+## 3. Methodology: the graph-to-world-model pipeline
 
-### Step A — Build one training example
-
-For each `(cell line, drug, dose, treated sample, plate)`, collect its treated single cells. Find `DMSO_TF` control cells from the **same cell line and plate**. Apply the same cell-quality filter to both. Keep the sample and plate IDs, because thousands of cells from one well are not thousands of independent experiments. Tahoe's `sample_metadata` gives the dose, `expression_data` gives per-cell raw RNA counts, `gene_metadata` maps gene tokens to genes, and `cell_line_metadata` gives cell-line identifiers and some genotype information.
-
-Normalize the cell profiles and summarize the control cells as (a) a distribution of learned cell-state embeddings and (b) mean, variation, and detection rate for each gene. This is the input reference state `Sref`. Build the same summaries from treated cells to obtain the observed output state `Sdrug`. Do **not** pass treated cells to the model at prediction time.
-
-### Step B — Make an external, fixed DTP reference
-
-Use [GSE84896](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE84896), which compares parental BT-474 cells with cells that persisted after **at least nine days of 2 µM lapatinib**. From its processed differential-expression file, select reliably increased and decreased genes using a rule fixed before testing Tahoe, such as adjusted `p < 0.05` plus a minimum effect size. This creates an **up-gene list** and a **down-gene list**.
-
-For each Tahoe cell, compute a simple score: average normalized expression of up genes minus average normalized expression of down genes. Within each cell line and plate, set the “high DTP-like” threshold from its DMSO controls, for example the control 95th percentile. For a drug condition, define:
+The graph is built **once, before model training**. For each drug question, we then place that cell line and drug on the graph. The **world model runs after the graph encoder** and predicts the treated cell population. The DTP score is calculated from that predicted population.
 
 ```text
-early-escape shift =
-    fraction of treated cells above the threshold
-  - fraction of matched control cells above the threshold
+ONE-TIME SETUP
+STRING protein interactions + Reactome pathways
+       ↓
+Fixed protein graph G
+
+FOR ONE CELL LINE + DRUG + DOSE
+Matched DMSO cells ──→ reference state Sref ──┐
+                                               ├→ features on G
+Drug targets + dose + molecular structure ────┘
+                                                    ↓
+                                  target diffusion + graph neural network
+                                                    ↓
+                                     graph-aware cell/drug representation
+                                                    ↓
+                                      WORLD MODEL Tθ  ← this is the state step
+                                                    ↓
+                                  predicted treated-cell distribution Ŝdrug
+                                                    ↓
+                     predicted DTP-like fraction + changed pathways/proteins
+
+TRAINING ONLY: compare Ŝdrug with Tahoe's measured treated cells Sdrug.
 ```
 
-This number is an **RNA-signature proxy**, not an observed count of living persister cells. The BT-474 signature is most defensible for BT-474/lapatinib. For other drugs or cancer types, either obtain relevant public DTP references and test transfer, or leave this label missing. Do not assign a universal DTP label to all Tahoe conditions from one BT-474 study.
+| Stage | When it happens | What goes in | What happens and comes out |
+|---|---|---|---|
+| **1. Build graph `G`** | Once, before training | Human [STRING physical interactions](https://en.string-db.org/cgi/download), [Reactome](https://reactome.org/download-data) pathways, gene-to-protein IDs | Proteins are nodes; physical interactions are edges. Keep this graph fixed across experiments. |
+| **2. Form reference state `Sref`** | For each cell line and plate | Matched Tahoe DMSO cells | A compact description of the cell population: per-cell embeddings, cell-state proportions, and RNA summaries for graph genes. This is the world model's starting state. |
+| **3. Put the action on the graph** | For each drug and dose | Drug targets, SMILES, concentration, and cell-line alterations | Mark target proteins and dose; attach baseline RNA and mutation features to protein nodes. Spread target signal to nearby proteins using bounded diffusion, following the idea in the [GRASP paper](</Users/nguyenhuyhai/Downloads/Graph_Grounded_Autonomous_Multi_channel_Reasoning_Agent_for_Interpretable_Open_World_Drug_Synergy_Prediction (7).pdf>). |
+| **4. Encode the graph** | Immediately before the world model | The now-annotated graph | A graph neural network mixes information across connected proteins. Its output tells the world model how this drug meets this cell line's biological state. |
+| **5. Apply world model `Tθ`** | Once for each proposed action | `Sref`, graph representation, drug structure, and dose | Predict the **distribution** of treated cells: how common each cell program will be and its gene-expression pattern. This is `P(Sdrug | Sref, drug, dose, G)`, not just a single response score. |
+| **6. Read out escape and explanations** | After the predicted state | Predicted treated-cell distribution and graph paths | Apply a fixed DTP gene signature to predicted cells; return the predicted high-score fraction and its change from DMSO. Rank short paths from known drug targets to changed programs. These proteins are follow-up hypotheses. |
+| **7. Learn and check** | During training and evaluation | Actual Tahoe treated cells; independent DTP data | Train the world model to match observed gene changes and cell-state proportions. Evaluate on held-out drugs and drug–cell-line pairs; check the DTP interpretation against later persister data. |
 
-### Step C — Learn the graph-grounded transition
+The transition in stage 5 can be implemented as a **mixture model**. First group control-cell embeddings into several cell programs. The world model predicts how the **size** and **RNA profile** of each program change after the drug. A decoder turns those predictions into a treated-cell distribution. This matters because a rare escape-like population can grow even when the average expression changes little.
 
-1. **Ground the drug.** Mark its known protein targets on the graph. Encode the molecule from its SMILES and its dose. Spread a limited amount of target information through nearby protein edges, as the original [GRASP paper](</Users/nguyenhuyhai/Downloads/Graph_Grounded_Autonomous_Multi_channel_Reasoning_Agent_for_Interpretable_Open_World_Drug_Synergy_Prediction (7).pdf>) does with drug-target diffusion.
-2. **Ground the cell line.** Put control-cell RNA summaries and known mutations on the matching protein nodes. A graph neural network combines these baseline features with the drug signal. The same drug can therefore act differently in different cell lines.
-3. **Predict the treated state.** A conditional transition network takes the graph representation, drug, dose, and `Sref`. It predicts both the drug-versus-vehicle gene/program changes and the **proportions of cell states** in `Sdrug`. A probabilistic output allows several possible treated cell states rather than one average profile.
-4. **Train from measured changes.** Use the many Tahoe conditions to penalize errors in treated-versus-control gene changes, changes in cell-state proportions, and the shape of the treated-cell distribution. Apply the fixed DTP scoring rule to the **predicted** treated distribution to obtain its predicted early-escape shift. This avoids needing DTP labels for every Tahoe condition. Weight each condition as an experimental unit so a well with more sequenced cells does not automatically dominate training.
-5. **Explain a prediction.** Trace a short path from the drug's known target through graph proteins to the predicted changing program. Test whether masking a proposed protein or edge changes the model prediction. Report such proteins as **hypotheses**: graph attention or masking alone does not prove that inhibiting a protein will stop persistence.
-
-The model can be written simply as:
+For the DTP readout, fix a signature from [GSE84896](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE84896): genes higher in long-term BT-474 lapatinib persisters and genes lower in them. Score each predicted cell as `mean(up genes) − mean(down genes)`. Call a cell “high DTP-like” only if its score exceeds a threshold set from matched DMSO cells. Then:
 
 ```text
-predicted 24-hour state, early-escape score
-    = WorldModel(control-cell state, drug, dose, protein graph)
+predicted early-escape shift
+  = predicted fraction of high-scoring treated cells
+  − fraction of high-scoring matched DMSO cells
 ```
 
-### Step D — Test whether the answer is useful
-
-- Hold out **entire drugs** and **drug–cell-line combinations**, not random cells from the same well. Compare with a control-mean predictor, a model without the protein graph, and established perturbation models such as chemCPA or MAP where feasible.
-- Measure prediction of expression changes **and** rare/high-score cell fractions. Test graph-pathway explanations against known drug targets and pathway annotations. Remove or randomize graph edges as an ablation.
-- Use [GSE156246](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE156246), an independent BT-474/HCC1419 lapatinib study with untreated, 6-hour, and **14-day DTP** samples, to check whether the early program points toward a real later persister program. This tests biological transfer; the experiments differ in dose, timing, and laboratory conditions, so it is not a perfect matched outcome study.
-- Report performance separately by cell line, drug type, and dose. Check whether the score is just generic stress, cell-cycle arrest, or cell death rather than a specific persister-related program.
+This is a **24-hour RNA-signature proxy**, not observed long-term survival. The BT-474 signature is most defensible for BT-474/lapatinib; other contexts need their own validated references. Tahoe's control and treated cells were measured in separate wells at the same endpoint, so stage 5 models a **one-step intervention effect**, not a tracked before/after cell trajectory. [GSE156246](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE156246) provides an independent 14-day DTP check. Protein rankings are graph-based hypotheses, not proven causal targets.
 
 ## 4. Public data and one concrete input/output example
 
@@ -95,16 +101,54 @@ predicted 24-hour state, early-escape score
 | [GSE156246](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE156246) | Independent later-DTP check | BT-474 untreated, 6-hour lapatinib, and 14-day DTP single-cell data |
 | [STRING](https://en.string-db.org/cgi/download) + [Reactome](https://reactome.org/download-data) | Protein graph and pathway names | Human physical links and pathway annotations |
 
-**Real metadata keys for an example:** Tahoe's BT-474 line has Cellosaurus ID `CVCL_0179` and DepMap ID `ACH-000927`. Its **lapatinib ditosylate, 0.5 µM** treatment is sample `smp_1601` on `plate2`. Two `plate2` DMSO samples are `smp_1685` and `smp_1686`, as shown in [Tahoe sample metadata](https://huggingface.co/datasets/tahoebio/Tahoe-100M/viewer/sample_metadata/train). These IDs identify the candidate input and outcome groups; retain this row only after checking that both groups have enough good BT-474 cells. (Tahoe also lists lapatinib at 0.05 µM as `smp_1505` and 5 µM as `smp_1697`; each dose needs controls from its own plate.)
+### 4.1 A real Tahoe example: BT-474 + lapatinib
 
-| Field for this example | Specific value or construction |
-|---|---|
-| **Input** | BT-474 control-cell RNA profiles from `CVCL_0179` in plate-2 `DMSO_TF` samples `smp_1685` and `smp_1686`; BT-474 mutation metadata; lapatinib ditosylate structure and checked targets; dose `0.5 µM`; fixed protein graph |
-| **Measured output** | BT-474 treated-cell RNA profiles from `smp_1601`, summarized as 24-hour gene changes and the distribution of cell programs |
-| **Derived training label** | The treated-minus-control fraction with a high score for the **GSE84896-derived** DTP program |
-| **Model output** | Predicted treated-cell distribution, predicted early-escape shift, uncertainty, and a ranked list of graph proteins/pathways for experimental follow-up |
+The following are **real public metadata entries**, not invented observations. Tahoe's [sample metadata](https://huggingface.co/datasets/tahoebio/Tahoe-100M/viewer/sample_metadata/train) identifies the wells; its drug and cell-line metadata identify the targets and genotype. The wells contain mixed cell lines, so select only `cell_line_id = CVCL_0179` expression rows inside each sample and retain the example only if those rows pass cell-count and quality checks.
 
-For clarity, **the following numbers are an invented calculation example, not Tahoe results**. Suppose 40 of 800 control cells and 150 of 600 treated cells exceed the pre-set signature threshold. The control fraction is `0.05`, the treated fraction is `0.25`, and the early-escape label is `0.25 − 0.05 = +0.20`. The real value for `smp_1601` must be computed from downloaded expression rows. A positive value means more **DTP-like RNA states at 24 hours**; it does **not** mean that 20% more cells were experimentally shown to survive nine days.
+| Role | Tahoe sample ID | Plate | Treatment | Dose | Cell-line filter |
+|---|---|---|---|---|---|
+| Reference input | `smp_1685` | `plate2` | `DMSO_TF` | 0 µM | BT-474, `CVCL_0179` |
+| Reference input | `smp_1686` | `plate2` | `DMSO_TF` | 0 µM | BT-474, `CVCL_0179` |
+| Measured outcome during training | `smp_1601` | `plate2` | Lapatinib ditosylate | 0.5 µM | BT-474, `CVCL_0179` |
+
+**Exact model input for this row** (the RNA arrays are the filtered cells from the two DMSO wells):
+
+| Input field | Specific example value | How the model uses it |
+|---|---|---|
+| Cell line | `BT-474`; Cellosaurus `CVCL_0179`; DepMap `ACH-000927`; breast cancer | Selects the biological context |
+| Reference cell population `Sref` | The per-cell `genes` and `expressions` arrays from BT-474 cells in `smp_1685` and `smp_1686` | Produces baseline RNA features and the distribution of cell states |
+| Cell-line alterations | `ERBB2` gain; `PIK3CA p.K111N`; `TP53 p.E285K` | Placed as annotations on those protein nodes; these are entries in Tahoe cell-line metadata |
+| Drug action | `Lapatinib ditosylate`, `0.5 µM`, PubChem CID `11557040` | Structure and dose encode the action |
+| Drug target nodes | `EGFR` and `ERBB2` | Both are marked as drug targets on the graph, according to Tahoe drug metadata; verify target evidence before final analysis |
+| Graph | Human STRING physical interactions plus Reactome pathway labels | A fixed network that connects drug targets to other proteins |
+
+For example, the **ERBB2 protein node** receives its BT-474 control-cell RNA summary, an `ERBB2 gain` annotation, and a `drug target = yes` marker. The **PIK3CA node** receives its control-cell RNA summary and `p.K111N` annotation, but no direct lapatinib-target marker. These node features are assembled **before** the graph neural network and world model run.
+
+**Exact measured output format for this row:**
+
+| Output field | Where the real value comes from | What one stored value looks like |
+|---|---|---|
+| Treated cells `Sdrug` | Tahoe `expression_data`, filtered to `sample = smp_1601` and `cell_line_id = CVCL_0179` | One row per treated cell: a `genes` token-ID array paired with an `expressions` raw-count array |
+| Treated population state | Summary of those treated-cell rows | Cell-program proportions and gene-expression summaries; compared with the two DMSO groups |
+| Early-escape label | Fixed GSE84896 DTP signature applied to the treated and control cells | One real number: `treated high-score fraction − control high-score fraction` |
+
+The actual RNA arrays and early-escape number for `smp_1601` must be calculated from the full Tahoe expression table. The public **sample IDs, dose, targets, and genotype above are verified**; no RNA count or escape value is invented and presented as a measurement.
+
+### 4.2 Small numerical example showing the final input and output
+
+**Every cell count and prediction in this next table is illustrative, not a measured Tahoe result.** It shows the exact kind of record the proposed benchmark would contain once the expression rows are processed.
+
+| Part of the example record | Concrete value | Meaning |
+|---|---|---|
+| Input: control state | 800 BT-474 DMSO cells; 40 score above the fixed threshold | Control high-score fraction `40 / 800 = 0.05` |
+| Input: action | Lapatinib ditosylate, 0.5 µM; targets `EGFR`, `ERBB2` | Drug action placed on the graph |
+| World-model output | Predicted treated-state distribution: high DTP-like `0.23`, other states `0.77` | Model expects 23% of treated cells to look DTP-like |
+| World-model output | Predicted early-escape shift `0.23 − 0.05 = +0.18` | Final numerical prediction for this task |
+| Measured training output | 600 treated BT-474 cells; 150 score above threshold | Observed high-score fraction `150 / 600 = 0.25` |
+| Derived training label | `0.25 − 0.05 = +0.20` | Target value used to judge the prediction `+0.18` |
+| Explanation output | Ranked target-to-pathway graph paths, with protein IDs and contribution scores | Protein hypotheses to test experimentally; Tahoe has no ground-truth label for these paths |
+
+A positive shift means **more cells with a DTP-like RNA program after 24 hours**. It does not mean that 20% more cells were shown to survive nine days. For true later DTP status, [GSE84896](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE84896) labels parental BT-474 samples (for example `GSM2253664`) separately from nine-day lapatinib persisters (for example `GSM2253666`); these are **different experiments and different samples** from Tahoe.
 
 ## Main claim the paper could honestly make
 
