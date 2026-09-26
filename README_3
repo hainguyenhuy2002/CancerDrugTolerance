@@ -1,0 +1,114 @@
+# Research proposal: A graph-based world model for drug response
+
+## Research question
+
+**Can a protein-graph world model use a drug's targets and a cell's starting state to predict how the cell responds over time, then use those predicted changes to estimate and explain single-drug sensitivity for new drug–cell settings?**
+
+This is a **single-drug response** problem, not drug synergy prediction (DSP). In the first public-data benchmark, we will check molecular changes at 6 and 24 hours and use dose-response AUC as the sensitivity measure. These time points and AUC are **ways to test the question**, not limits on the question itself. We will also test drugs and cell lines excluded from training.
+
+| Problem | Input | Main output |
+| --- | --- | --- |
+| Supplied DSP paper | Two drugs + one cell line | Synergy score |
+| Proposed study | One drug + one cell line | Dose-response AUC |
+
+
+## Why study this?
+
+A standard sensitivity model predicts a response score directly. It may make an accurate prediction without showing what the drug changes inside the cell. This study asks the model to predict a measurable molecular response first, then tests whether that response improves sensitivity prediction and supports a useful explanation.
+
+[LINCS L1000](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE92742) provides drug-induced gene-expression changes. [PRISM](https://depmap.org/repurposing/) provides single-drug viability and AUC measurements. The study links these resources where drug and cell identities can be matched.
+
+**Novelty to test:** Can a source-grounded drug-target signal drive a reusable **cell-state transition** that improves both molecular-response and sensitivity predictions for unseen drugs? Drug perturbation modeling is an active research area, so the paper must demonstrate this benefit rather than claim to be the first drug-response world model. [XPert](https://www.nature.com/articles/s42256-025-01165-w) models dose–time expression responses, and [ProteinTalks](https://www.nature.com/articles/s41586-026-11001-9) models temporal protein responses and efficacy. Both are important comparisons.
+
+## Input and output: one real record
+
+The [PRISM secondary screen](https://depmap.org/repurposing/) contains this [public record](https://datasets-server.huggingface.co/rows?dataset=donb-hf%2Fsecondary-screen-dose-response-curve-parameters&config=default&split=train&offset=10289&length=1):
+
+| Item | Value |
+| --- | --- |
+| Drug | AZD3463, ID `BRD-K24593301-001-02-3` |
+| Cell line | HCC827, DepMap ID `ACH-000012` |
+| Listed drug targets | ALK, IGF1R |
+| Measured dose-response AUC | **0.547471977108906** |
+| Dose-curve fit R² | 0.853330349419187 |
+
+For this query, the **input** would be the drug, its available target evidence, HCC827's untreated profile, and the dose range. The **main output** would be predicted AUC with uncertainty. The model would also output predicted 6-hour and 24-hour expression changes and the graph paths supporting its prediction.
+
+The AUC above is a real experimental label. The PRISM record does **not** provide 6-hour or 24-hour expression measurements for AZD3463 in HCC827; we do not invent those values.
+
+## Methodology: how the world model works
+
+### 1. Given the protein graph, define the state
+
+Let `G = (V, E)` be a human protein graph. Each node in `V` represents a protein product; each edge in `E` represents a documented protein connection. Use a confidence score for each edge.
+
+For cell line `c`, put its **untreated gene expression** on the matching protein nodes. If available, add mutation and copy-number information. This forms the initial state `S0(c)`. We call it a *protein-indexed cell state* because the measurements are aligned to protein nodes. Gene expression is **not** the same thing as measured protein amount or protein activity.
+
+The changing state `St` contains a learned value for each relevant graph node at time `t`, together with the drug-exposure history. A decoder turns that internal state into predicted gene-expression changes that can be compared with LINCS measurements.
+
+### 2. Given a drug, define the action
+
+For drug `d` and concentration `q`, find the drug's documented protein targets. Place an action signal on those target nodes. Keep the drug's effect type (for example, inhibition), source, and confidence when known.
+
+The action is **continued exposure to drug `d` at concentration `q` for a stated time interval**. The second time step does not mean giving the drug a second time. It means allowing the cell to respond while exposure continues.
+
+### 3. Apply the transition to predict what happens next
+
+Train one transition function and reuse it at each step:
+
+`St+Δt = Transition(St, drug target signals, q, Δt, G)`
+
+Starting with `S0`, apply the transition for 0–6 hours to obtain `S6`. Starting with the *predicted* `S6`, apply the same transition for the next 18 hours to obtain `S24`. Graph messages let a target perturbation affect connected proteins; the current state determines how strongly that signal propagates in this cell line.
+
+Decode `S6` and `S24` into predicted expression-change signatures. Compare them with LINCS 6-hour and 24-hour signatures for matching drug, cell line, and dose. If only one time point exists for a condition, use it for that time-point loss; do not pretend the other was measured.
+
+**Important limit:** LINCS 6-hour and 24-hour records normally come from separate treated wells. They describe the same *experimental condition* at different times, not a tracked history of the same cells. The world model's 6→24 step is therefore a learned, condition-level transition.
+
+### 4. Convert the predicted state into drug sensitivity
+
+For each dose in the PRISM screen, start from the same untreated cell state, simulate exposure, and predict viability from the later state. Combine those viability predictions into a dose-response curve and calculate its AUC.
+
+PRISM provides dose-level log2 fold changes relative to controls and a fitted AUC. Convert the fold changes to relative viability using the PRISM README before training the viability output. The same transition model can learn from LINCS expression labels and PRISM response labels, even when every drug–cell pair does not appear in both datasets. First measure the actual overlap; never assume the datasets are fully paired.
+
+### 5. Return an explanation and uncertainty
+
+For each AUC prediction, return the documented drug targets, predicted changing genes, graph paths between them, and the sources of the target claims. Report uncertainty when target evidence or predicted effects are weak. Check an explanation by removing its highly ranked graph nodes and seeing whether the prediction changes more than it does after removing comparable control nodes.
+
+**Pipeline:** protein graph + untreated cell state + drug target signals → simulated 6-hour state → simulated 24-hour state → viability across doses → AUC and explanation.
+
+
+## Exact public files to use
+
+Choose these releases and keep their versions fixed. The LINCS matrix is large, so extract only selected signatures and genes while processing it.
+
+| Source | Files | Purpose |
+| --- | --- | --- |
+| [LINCS GSE92742](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE92742) | `GSE92742_Broad_LINCS_Level5_COMPZ.MODZ_n473647x12328.gctx.gz` | Drug-induced expression-change labels. Start with the 978 landmark genes. |
+| Same LINCS release | `GSE92742_Broad_LINCS_sig_info.txt.gz`; `GSE92742_Broad_LINCS_sig_metrics.txt.gz` | Drug, cell, dose, **time**, signature ID, and quality fields. |
+| Same LINCS release | `GSE92742_Broad_LINCS_pert_info.txt.gz`; `GSE92742_Broad_LINCS_cell_info.txt.gz`; `GSE92742_Broad_LINCS_gene_info_delta_landmark.txt.gz` | Drug, cell, and measured-gene identifiers. |
+| [PRISM secondary screen](https://depmap.org/repurposing/) | `secondary-screen-dose-response-curve-parameters.csv` | Main AUC labels and curve-fit quality. |
+| Same PRISM release | `secondary-screen-replicate-collapsed-logfold-change.csv`; `secondary-screen-replicate-collapsed-treatment-info.csv` | Dose-level log2 fold changes and drug/dose metadata. Convert fold changes to relative viability as described in the README. |
+| Same PRISM release | `secondary-screen-cell-line-info.csv`; `secondary-screen-readme.txt` | Cell IDs, assay fields, and processing rules. |
+| [DepMap Public 24Q2](https://depmap.org/portal/download/all/) | `OmicsExpressionProteinCodingGenesTPMLogp1.csv`; `Model.csv` | Untreated cell expression and cell-line identifiers. [DepMap confirms the expression filename](https://forum.depmap.org/t/cell-line-selector-what-data-does-it-use-for-expression/3740/2). |
+| [STRING human network, v12.0](https://string-db.org/cgi/download) | `9606.protein.links.v12.0.txt.gz`; `9606.protein.info.v12.0.txt.gz` | Protein connections and identifier mapping. |
+
+Optional DepMap files `OmicsCNGene.csv` and `OmicsSomaticMutations.csv` add copy-number and mutation features. The first study can start without them.
+
+## How to evaluate the idea
+
+1. Match cell lines by stable IDs and review ambiguous drug names, salts, and batches. Report the number of usable LINCS–PRISM–DepMap matches and the number with both LINCS time points.
+2. Hold out complete drugs from **both** LINCS and PRISM training data for the main unseen-drug test. Also test held-out cell lines and held-out drug–cell pairs. Public target annotations may be available at test time; measured response labels may not.
+3. Compare AUC error and drug ranking with a direct drug-plus-untreated-cell model. Also remove the graph or the 6→24 transition to test whether each part helps.
+4. Check predicted expression changes against held-out LINCS signatures, and check whether highlighted proteins actually affect model predictions.
+
+The world-model claim is supported only if the predicted states agree with measured molecular changes **and** help predict held-out AUC.
+
+## Closest studies
+
+- [GRASP, supplied paper](</Users/nguyenhuyhai/Downloads/Graph_Grounded_Autonomous_Multi_channel_Reasoning_Agent_for_Interpretable_Open_World_Drug_Synergy_Prediction (7).pdf>): shared drug–cell protein graph and evidence-grounded explanations for DSP.
+- [chemCPA, NeurIPS 2022](https://proceedings.neurips.cc/paper_files/paper/2022/hash/aa933b5abc1be30baece1d230ec575a7-Abstract.html) and [PRnet, Nature Communications 2024](https://www.nature.com/articles/s41467-024-53457-1): predict drug-induced molecular responses.
+- [CellHit, Nature Communications 2025](https://www.nature.com/articles/s41467-025-56827-5): predicts cancer drug sensitivity from untreated cells.
+- [XPert, Nature Machine Intelligence 2026](https://www.nature.com/articles/s42256-025-01165-w): predicts dose- and time-dependent drug-induced expression.
+- [ProteinTalks, Nature 2026](https://www.nature.com/articles/s41586-026-11001-9): models temporal protein responses and drug efficacy.
+
+**Working title:** *Graph-Grounded World Models for Drug-Induced Cell-State Dynamics and Sensitivity*.
