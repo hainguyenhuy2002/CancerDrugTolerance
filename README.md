@@ -1,14 +1,28 @@
+# common pattern of World Model in Genomic
+For models that predict drug response, the shared idea is:
+
+> **Starting state + intervention + context → predicted new state**
+
+For example, a model may start with a cancer cell's protein levels, add a named drug at a certain dose, and predict the protein levels six hours later.
+
+- **Starting state:** What is the system like before the action? This might be a protein's 3D shape, a cell's gene activity, or its protein levels. The state can also be a shorter representation learned by the model.
+- **Intervention:** What changes? This might be a drug, a dose, a drug combination, or a gene knockout.
+- **Context:** In which cell type, environment, and time period does the change happen? The same drug can have different effects in different settings.
+- **New state:** What does the model predict after the intervention? This could be changed gene activity or protein levels. Some models also predict a later outcome, such as drug sensitivity.
+- **Check:** Do the predictions match experiments that the model did not see during training?
+
+
 # Research proposal: A graph-based world model for drug response
 
 ## Research question
 
-**Can a protein-graph world model predict how a drug changes a cancer cell and how sensitive that cell is to the drug?**
+**Can a protein-graph world model predict how a drug changes a cancer cell and explain how sensitive that cell is to the drug?**
 
 We will test whether predicting the cell's changes improves sensitivity prediction for unseen drugs and cell lines. The first public-data benchmark uses LINCS expression changes at 6 and 24 hours and PRISM dose-response AUC. This is a **single-drug response** problem, not drug synergy prediction (DSP).
 
 | Problem | Input | Main output |
 | --- | --- | --- |
-| Supplied DSP paper | Two drugs + one cell line | Synergy score |
+| Our previous paper | Two drugs + one cell line | Synergy score |
 | Proposed study | One drug + one cell line | Dose-response AUC |
 
 
@@ -20,21 +34,24 @@ A standard sensitivity model predicts a response score directly. It may make an 
 
 **Novelty to test:** Can a source-grounded drug-target signal drive a reusable **cell-state transition** that improves both molecular-response and sensitivity predictions for unseen drugs? Drug perturbation modeling is an active research area, so the paper must demonstrate this benefit rather than claim to be the first drug-response world model. [XPert](https://www.nature.com/articles/s42256-025-01165-w) models dose–time expression responses, and [ProteinTalks](https://www.nature.com/articles/s41586-026-11001-9) models temporal protein responses and efficacy. Both are important comparisons.
 
-## Input and output: one real record
+## Input and output:
 
-The [PRISM secondary screen](https://depmap.org/repurposing/) contains this [public record](https://datasets-server.huggingface.co/rows?dataset=donb-hf%2Fsecondary-screen-dose-response-curve-parameters&config=default&split=train&offset=10289&length=1):
 
-| Item | Value |
-| --- | --- |
-| Drug | AZD3463, ID `BRD-K24593301-001-02-3` |
-| Cell line | HCC827, DepMap ID `ACH-000012` |
-| Listed drug targets | ALK, IGF1R |
-| Measured dose-response AUC | **0.547471977108906** |
-| Dose-curve fit R² | 0.853330349419187 |
+- **Input:** `(drug, cell line, dose)`
+- **Output:** Two gene-expression change vectors: one at **6 hours** and one at **24 hours**. Each vector has one signed LINCS Level 5 score for each of the 978 directly measured genes.
 
-For this query, the **input** would be the drug, its available target evidence, HCC827's untreated profile, and the dose range. The **main output** would be predicted AUC with uncertainty. The model would also output predicted 6-hour and 24-hour expression changes and the graph paths supporting its prediction.
+**Example input:** `(alvespimycin, MCF7, 0.08 µM)`
 
-The AUC above is a real experimental label. The PRISM record does **not** provide 6-hour or 24-hour expression measurements for AZD3463 in HCC827; we do not invent those values.
+**Example output format:**
+
+| Gene | 6-hour score | 24-hour score |
+| --- | ---: | ---: |
+| AARS | +1.20 | +0.40 |
+| ABCB6 | −0.45 | −1.10 |
+| ABCC5 | +0.03 | +0.15 |
+| Remaining genes | … | … |
+
+The drug, cell line, dose, and both time points occur in [LINCS metadata](https://ftp.ncbi.nlm.nih.gov/geo/series/GSE92nnn/GSE92742/suppl/GSE92742_Broad_LINCS_sig_info.txt.gz).
 
 ## Methodology: how the world model works
 
@@ -42,7 +59,7 @@ The AUC above is a real experimental label. The PRISM record does **not** provid
 
 Let `G = (V, E)` be a human protein graph. Each node in `V` represents a protein product; each edge in `E` represents a documented protein connection. Use a confidence score for each edge.
 
-For cell line `c`, put its **untreated gene expression** on the matching protein nodes. If available, add mutation and copy-number information. This forms the initial state `S0(c)`. We call it a *protein-indexed cell state* because the measurements are aligned to protein nodes. Gene expression is **not** the same thing as measured protein amount or protein activity.
+For cell line `c`, put its **untreated gene expression** on the matching protein nodes. If available, add mutation and copy-number information. This forms the initial state `S0(c)`, called  *protein-indexed cell state*.
 
 The changing state `St` contains a learned value for each relevant graph node at time `t`, together with the drug-exposure history. A decoder turns that internal state into predicted gene-expression changes that can be compared with LINCS measurements.
 
@@ -50,7 +67,7 @@ The changing state `St` contains a learned value for each relevant graph node at
 
 For drug `d` and concentration `q`, find the drug's documented protein targets. Place an action signal on those target nodes. Keep the drug's effect type (for example, inhibition), source, and confidence when known.
 
-The action is **continued exposure to drug `d` at concentration `q` for a stated time interval**. The second time step does not mean giving the drug a second time. It means allowing the cell to respond while exposure continues.
+The action is **continued exposure to drug `d` at concentration `q` for a stated time interval**.
 
 ### 3. Apply the transition to predict what happens next
 
@@ -60,7 +77,7 @@ Train one transition function and reuse it at each step:
 
 Starting with `S0`, apply the transition for 0–6 hours to obtain `S6`. Starting with the *predicted* `S6`, apply the same transition for the next 18 hours to obtain `S24`. Graph messages let a target perturbation affect connected proteins; the current state determines how strongly that signal propagates in this cell line.
 
-Decode `S6` and `S24` into predicted expression-change signatures. Compare them with LINCS 6-hour and 24-hour signatures for matching drug, cell line, and dose. If only one time point exists for a condition, use it for that time-point loss; do not pretend the other was measured.
+Decode `S6` and `S24` into predicted expression-change signatures. Compare them with LINCS 6-hour and 24-hour signatures for matching drug, cell line, and dose. If only one time point exists for a condition, use it for that time-point loss;
 
 **Important limit:** LINCS 6-hour and 24-hour records normally come from separate treated wells. They describe the same *experimental condition* at different times, not a tracked history of the same cells. The world model's 6→24 step is therefore a learned, condition-level transition.
 
