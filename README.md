@@ -1,4 +1,4 @@
-# common pattern of World Model in Genomic
+# Common pattern of World Model in Genomic
 For models that predict drug response, the shared idea is:
 
 > **Starting state + intervention + context → predicted new state**
